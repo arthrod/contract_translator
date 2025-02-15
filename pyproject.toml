@@ -1,35 +1,52 @@
 [project]
-name = 'name'         
+name = 'contract_translation_pipeline'         
 version = '0.1.0'                  
-description = 'description' 
+description = 'Contract Translation Pipeline' 
 authors = [{name = 'arthrod', email = 'arthrod@gmail.com'}]
 requires-python = '>=3.12'         
-keywords = ['xx', 'xx', 'xx', 'x x', 'xxx xx']
+keywords = ['contracts', 'translation', 'pipeline']
 dependencies = [
+    # Core numerical and scientific dependencies (pre-built wheels)
+    'numpy',
+    'scipy',
+    'pandas',
+    # NLP and ML
+    'nltk',
+    # Document processing
+    'beautifulsoup4',
+    'lxml',
+    'markdown',
+    # API and networking
+    'requests',
+    'urllib3',
+    'elastic-transport',
+    'elasticsearch',
+    # Utilities
     'tqdm',
-    'typer',
-    'python-dotenv',
-	#'aiosmtplib',
-	#'aioimaplib',
-	#'asyncpg',
-	#'litellm',
-	#'openai',
-	#'python-genai',
-	#'PyPDF2',
-	#'python-docx',
-	#'cmi-docx', 
-	#'reportlab', 
-	#'serpapi', 
-	#'crewai',
-	#'crewai-tools',
-	#'markdown2',
-	#'pytz', 
+    'python-dateutil',
+    'pytz',
+    'regex',
+    'click',
+    'tenacity>=9.0.0',
+    'typer[all]>=0.9.0',
+    'rich>=13.7.0',
+    # Google API
+    'google-generativeai>=0.3.2',
+    # Development utilities
+    'setuptools',
+    'typing-extensions',
+    "typer>=0.15.1",
+    "tenacity>=9.0.0",
+    "pytest>=8.3.4",
+    "loguru>=0.7.3",
+    "google-genai>=1.2.0",
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]
 
 test = [
-    'pytest>=7.0',
+    'pytest',
     'pytest-asyncio',
     'pytest-cov',
     'pytest-mock',
@@ -90,7 +107,7 @@ keep-runtime-typing = true
 packages = ['src']                 
 
 [tool.mypy]
-python_version = '3.12'           
+python_version = '3.9'           
 strict = true      
 no_implicit_optional = true
 warn_unused_ignores = true
