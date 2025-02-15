@@ -26,10 +26,13 @@ async def translate(
     target_language: str | None = None,
     model: str = 'gemini-2.0-flash',
     max_retries: int = 100,
-    concurrent_attempts: int = 1,
+    concurrent_attempts: int = 3,
+    voting_enabled: bool = True,
+    glossary_terms: list[dict[str, str]] | None = None,
 ) -> str:
     """
-    Translate text using Gemini API with context awareness and robust error handling.
+    Translate text using Gemini API with context awareness, robust error handling, majority voting,
+    and glossary term support.
 
     Args:
         text_to_be_translated: Text to translate
@@ -40,6 +43,9 @@ async def translate(
         model: Gemini model to use (default: gemini-2.0-flash)
         max_retries: Maximum retry attempts per task
         concurrent_attempts: Number of concurrent translation attempts
+        voting_enabled: Whether to use majority voting mechanism (default: True)
+        glossary_terms: List of dictionaries containing terms and their translations
+                       Format: [{"term": "term1", "translation": "trans1", "context": "ctx1"}, ...]
 
     Returns:
         Translated text string
@@ -47,6 +53,8 @@ async def translate(
     Raises:
         RuntimeError: If all translation attempts fail
     """
+    from collections import Counter
+
     api_key = os.getenv('GEMINI_API_KEY')
     if not api_key:
         raise ValueError('GEMINI_API_KEY environment variable is required')
@@ -58,6 +66,16 @@ async def translate(
 
         while retry_count < max_retries:
             try:
+                # Build glossary instructions if terms are provided
+                glossary_instructions = ''
+                if glossary_terms:
+                    glossary_instructions = '\nGlossary terms to use in translation:\n'
+                    for term in glossary_terms:
+                        term_entry = f'- {term["term"]} → {term["translation"]}'
+                        if term.get('context'):
+                            term_entry += f' (Context: {term["context"]})'
+                        glossary_instructions += term_entry + '\n'
+
                 prompt = f"""
                 Translate the following text from {origin_language or 'auto-detect'} to {target_language or 'English'}.
                 The text to translate is wrapped in XML-style tags. Context is provided for accuracy but should not be translated.
@@ -65,10 +83,13 @@ async def translate(
                 {f'<context_before>{context_before}</context_before>' if context_before else ''}
                 <text_to_translate>{text_to_be_translated}</text_to_translate>
                 {f'<context_after>{context_after}</context_after>' if context_after else ''}
+                {glossary_instructions}
 
                 Requirements:
                 - Translate ONLY the text between <text_to_translate> tags
                 - Use surrounding context to ensure accurate meaning and tone
+                - STRICTLY use the provided glossary translations when those terms appear
+                - If a term appears in context matching a glossary entry, use the provided translation
                 - Preserve all formatting and special characters
                 - Maintain document style and formality level
                 - Return only the translated text
@@ -80,6 +101,7 @@ async def translate(
                 logger.info(f'Context After: {context_after}')
                 logger.info(f'Source Language: {origin_language}')
                 logger.info(f'Target Language: {target_language}')
+                logger.info(f'Glossary Terms: {glossary_terms}')
                 logger.info(f'Full Prompt:\n{prompt}')
 
                 response = await client.aio.models.generate_content(
@@ -87,7 +109,6 @@ async def translate(
                     contents=prompt,
                 )
 
-                # Log full API response
                 logger.info('=== API Response ===')
                 logger.info(f'Response object: {response}')
                 logger.info(f'Candidates: {response.candidates}')
@@ -120,26 +141,29 @@ async def translate(
 
         return None
 
-    if concurrent_attempts > 1:
+    if voting_enabled:
         tasks = [asyncio.create_task(single_translation_attempt()) for _ in range(concurrent_attempts)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        valid_translations = [r for r in results if isinstance(r, str)]
 
-        for task in pending:
-            task.cancel()
+        if not valid_translations:
+            raise RuntimeError('All translation attempts failed')
 
-        for completed_task in done:
-            try:
-                result = completed_task.result()
-                if result:
-                    return result
-            except Exception as e:
-                logger.warning(f'Task failed: {e}')
-                continue
-    else:
-        result = await single_translation_attempt()
-        if result:
-            return result
+        counts = Counter(valid_translations)
+        majority_translation = counts.most_common(1)[0][0]
+
+        logger.info('=== Voting Results ===')
+        logger.info(f'Valid translations: {len(valid_translations)}')
+        logger.info(f'Translation counts: {counts}')
+        logger.info(f'Selected translation: {majority_translation}')
+        logger.info('=' * 80)
+
+        return majority_translation
+
+    result = await single_translation_attempt()
+    if result:
+        return result
 
     raise RuntimeError('All translation attempts failed')
 

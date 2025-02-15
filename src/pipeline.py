@@ -3,6 +3,8 @@
 
 import asyncio
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,14 @@ app = typer.Typer(
 # Logging configuration
 # ------------
 logger.add('translation_pipeline.log', rotation='500 MB', level='INFO', format='{time} - {level} - {message}')
+
+
+@dataclass
+class ProcessedTerm:
+    word: str
+    context_before: str
+    context_after: str
+    translation: str | None = None
 
 
 # ------------
@@ -77,7 +87,7 @@ def chunk_text_by_tokens(
 async def process_glossary_terms(terms_file: Path | None, origin_language: str, target_language: str, model: str) -> list[dict[str, str]]:
     """
     Process and translate glossary terms from a JSON file.
-    Expected format: [{"term": "term1", "context": "context1"}, ...]
+    Expected format: [{"term": "term1", "context": "context1", "additional_context": "extra1"}, ...]
     """
     if not terms_file or not terms_file.exists():
         logger.info("No glossary file provided or file doesn't exist")
@@ -88,18 +98,39 @@ async def process_glossary_terms(terms_file: Path | None, origin_language: str, 
             content = await f.read()
             raw_terms = json.loads(content)
 
-        # Transform terms into the expected format
-        formatted_terms = [
-            {'word': term['term'], 'context_before': term.get('context', ''), 'context_after': term.get('additional_context', '')}
-            for term in raw_terms
-        ]
+        # Validate and format terms
+        formatted_terms = []
+        for term in raw_terms:
+            if not isinstance(term, dict) or 'term' not in term:
+                logger.warning(f'Skipping invalid glossary entry: {term}')
+                continue
+            formatted_terms.append(
+                ProcessedTerm(
+                    word=term['term'],
+                    context_before=term.get('context', ''),
+                    context_after=term.get('additional_context', ''),
+                )
+            )
 
+        # Translate terms
         translated_terms = await translate_glossary_terms(
-            terms=formatted_terms, origin_language=origin_language, target_language=target_language, model=model
+            terms=[
+                {'word': term.word, 'context_before': term.context_before, 'context_after': term.context_after} for term in formatted_terms
+            ],
+            origin_language=origin_language,
+            target_language=target_language,
+            model=model,
         )
 
-        logger.info(f'Processed {len(translated_terms)} glossary terms')
-        return translated_terms
+        # Update translations
+        for term, translated in zip(formatted_terms, translated_terms):
+            if isinstance(translated, dict) and 'translation' in translated:
+                term.translation = translated['translation']
+            else:
+                logger.warning(f'Failed to get translation for term: {term.word}')
+
+        logger.info(f'Processed {len(formatted_terms)} glossary terms')
+        return formatted_terms
 
     except Exception as e:
         logger.error(f'Error processing glossary terms: {e}')
@@ -109,50 +140,97 @@ async def process_glossary_terms(terms_file: Path | None, origin_language: str, 
 # ------------
 # HTML Processing
 # ------------
-def extract_text_from_html(html_content: str) -> tuple[str, dict[int, tuple[str, str]]]:
+def extract_text_from_html(html_content: str) -> tuple[str, dict[int, tuple[str, dict[str, str]]]]:
     """
-    Extracts text while preserving HTML tag positions and context.
-    Returns: (plain_text, tag_positions)
+    Enhanced text extraction that preserves HTML structure and attributes.
+
+    Returns:
+        tuple containing:
+        - Plain text with tags removed
+        - Dictionary mapping positions to (tag_name, attributes) tuples
     """
     soup = BeautifulSoup(html_content, 'lxml')
     text = ''
-    tag_positions: dict[int, tuple[str, str]] = {}
+    tag_positions: dict[int, tuple[str, dict[str, str]]] = {}
 
     def process_node(node, current_pos: int) -> int:
         nonlocal text
         if isinstance(node, NavigableString):
-            text += str(node)
-            return current_pos + len(str(node))
+            # Skip ```html markers
+            content = str(node)
+            if '```html' not in content:
+                text += content
+                return current_pos + len(content)
+            return current_pos
+
         if isinstance(node, Tag):
-            tag_positions[current_pos] = (str(node.name), 'open')
+            # Store tag with all attributes
+            attrs = dict(node.attrs) if node.attrs else {}
+            tag_positions[current_pos] = (str(node.name), {'type': 'open', 'attrs': attrs})
+
             for child in node.children:
                 current_pos = process_node(child, current_pos)
-            tag_positions[current_pos] = (str(node.name), 'close')
-            return current_pos
+
+            # Store closing tag
+            tag_positions[current_pos] = (str(node.name), {'type': 'close'})
+
         return current_pos
 
     process_node(soup, 0)
     return text, tag_positions
 
 
-def reinsert_html_tags(translated_text: str, tag_positions: dict[int, tuple[str, str]]) -> str:
-    """Reinserts HTML tags into translated text while maintaining structure."""
-    result = ''
+def reinsert_html_tags(translated_text: str, tag_positions: dict[int, tuple[str, dict[str, str]]]) -> str:
+    """
+    Reinserts HTML tags with enhanced position tracking and attribute preservation.
+    """
+    result = []
     current_pos = 0
+    text_length = len(translated_text)
 
+    # Sort positions to ensure proper tag ordering
     sorted_positions = sorted(tag_positions.items())
 
-    for pos, (tag_name, tag_type) in sorted_positions:
-        if pos > current_pos:
-            result += translated_text[current_pos:pos]
+    for pos, (tag_name, tag_info) in sorted_positions:
+        # Add text content before tag
+        if pos > current_pos and current_pos < text_length:
+            result.append(translated_text[current_pos:pos])
 
-        result += f'<{"" if tag_type == "close" else ""}{tag_name}>'
+        # Construct tag with attributes
+        if tag_info['type'] == 'close':
+            result.append(f'</{tag_name}>')
+        else:
+            attrs = tag_info.get('attrs', {})
+            attr_str = ' '.join(f'{k}="{v}"' for k, v in attrs.items())
+            result.append(f'<{tag_name}{" " + attr_str if attr_str else ""}>')
+
         current_pos = pos
 
-    if current_pos < len(translated_text):
-        result += translated_text[current_pos:]
+    # Add remaining text
+    if current_pos < text_length:
+        result.append(translated_text[current_pos:])
 
-    return result
+    return ''.join(result)
+
+
+def clean_translated_html(html_content: str) -> str:
+    """
+    Cleans translated HTML by removing ```html markers and fixing common issues.
+    """
+    # Remove ```html markers
+    cleaned = re.sub(r'```html\n?', '', html_content)
+    cleaned = re.sub(r'\n?```', '', cleaned)
+
+    # Fix common translation artifacts
+    cleaned = re.sub(r'&lt;', '<', cleaned)
+    cleaned = re.sub(r'&gt;', '>', cleaned)
+
+    # Normalize whitespace around tags
+    cleaned = re.sub(r'\s+(?=</)', '', cleaned)  # Remove space before closing tags
+    cleaned = re.sub(r'>\s+', '> ', cleaned)  # Normalize space after tags
+    cleaned = re.sub(r'\s+<', ' <', cleaned)  # Normalize space before tags
+
+    return cleaned.strip()
 
 
 # ------------
@@ -164,7 +242,7 @@ async def process_segment(
     model: str,
     origin_language: str,
     target_language: str,
-    glossary: list[dict[str, str]] | None = None,
+    glossary: list[ProcessedTerm] | None = None,
     context_window: int = 2000,
     log_path: Path | None = None,
 ) -> str:
@@ -172,81 +250,73 @@ async def process_segment(
     try:
         text, start, end = segment_text
 
-        # Extract context
-        prefix = original_html[max(0, start - context_window) : start]
-        suffix = original_html[end : min(len(original_html), end + context_window)]
+        # Don't process empty segments
+        if not text.strip():
+            return text
 
-        translated_text = await translate(
-            text_to_be_translated=text,
-            context_before=prefix,
-            context_after=suffix,
-            origin_language=origin_language,
-            target_language=target_language,
-            model=model,
-        )
+        # Extract context with proper text content
+        prefix = original_html[max(0, start - context_window) : start].strip()
+        suffix = original_html[end : min(len(original_html), end + context_window)].strip()
 
-        if log_path:
-            async with aiofiles.open(log_path, 'a') as f:
-                await f.write(f'Segment translation:\nOriginal: {text}\nTranslated: {translated_text}\n\n')
-
-        # Apply glossary terms if available
+        # Prepare glossary context for translation
+        glossary_context = None
         if glossary:
-            for term in glossary:
-                if term.get('translation'):
-                    translated_text = translated_text.replace(term['word'], term['translation'])
+            glossary_context = [
+                {'term': term.word, 'translation': term.translation, 'context': f'{term.context_before} {term.context_after}'.strip()}
+                for term in glossary
+                if term.translation
+            ]
 
-        return translated_text
+        # Only attempt translation if we have actual text to translate
+        if text.strip():
+            translated_text = await translate(
+                text_to_be_translated=text.strip(),
+                context_before=prefix if prefix else None,
+                context_after=suffix if suffix else None,
+                origin_language=origin_language,
+                target_language=target_language,
+                model=model,
+                glossary_terms=glossary_context,
+            )
+
+            if log_path:
+                async with aiofiles.open(log_path, 'a') as f:
+                    await f.write(f'Segment translation:\nOriginal: {text}\nTranslated: {translated_text}\n\n')
+
+            # Apply glossary terms with context awareness
+            if glossary:
+                translated_text = apply_glossary_terms(translated_text, glossary)
+
+            return translated_text
+
+        return text
+
     except Exception as e:
         logger.error(f'Segment processing error: {e}')
         return text
 
 
-async def process_single_contract(
-    contract_data: dict,
-    model: str,
-    origin_language: str,
-    target_language: str,
-    tokenizer: Any,
-    log_path: Path,
-    glossary: list[dict[str, str]] | None = None,
-    max_chunk_tokens: int = 1000,
-    overlap_tokens: int = 50,
-) -> dict:
-    """Process a single contract with enhanced chunking and HTML preservation."""
-    try:
-        original_html = contract_data['contracts']
+def apply_glossary_terms(text: str, glossary: list[ProcessedTerm]) -> str:
+    """Apply translated glossary terms to the text with context awareness."""
+    if not glossary:
+        return text
 
-        # Extract text and tag positions
-        plain_text, tag_positions = extract_text_from_html(original_html)
+    processed_text = text
+    for term in glossary:
+        if term.translation:
+            # Create a context-aware replacement using regex
+            if term.context_before and term.context_after:
+                pattern = re.compile(
+                    rf'(?<!\w){re.escape(term.context_before)}\s*?{re.escape(term.word)}\s*?{re.escape(term.context_after)}(?!\w)',
+                    re.IGNORECASE,
+                )
+                processed_text = pattern.sub(f'{term.context_before} {term.translation} {term.context_after}', processed_text)
 
-        # Chunk the text while preserving token context
-        chunks = chunk_text_by_tokens(plain_text, max_tokens=max_chunk_tokens, overlap_tokens=overlap_tokens)
+            else:
+                pattern = re.compile(rf'(?<!\w){re.escape(term.word)}(?!\w)', re.IGNORECASE)
+                processed_text = pattern.sub(term.translation, processed_text)
 
-        # Translate chunks
-        translated_chunks = []
-        for chunk in chunks:
-            translated_chunk = await process_segment(
-                segment_text=chunk,
-                original_html=original_html,
-                model=model,
-                origin_language=origin_language,
-                target_language=target_language,
-                glossary=glossary,
-                log_path=log_path,
-            )
-            translated_chunks.append(translated_chunk)
-
-        # Combine translated chunks and reinsert HTML
-        combined_translation = ''.join(translated_chunks)
-        translated_html = reinsert_html_tags(combined_translation, tag_positions)
-
-        # Update contract data
-        contract_data['contratos'] = translated_html
-        return contract_data
-
-    except Exception as e:
-        logger.error(f'Error processing contract: {e!s}')
-        return contract_data
+    return processed_text
 
 
 async def process_contracts_pipeline(
@@ -257,7 +327,7 @@ async def process_contracts_pipeline(
     target_language: str,
     glossary_path: str | None = None,
 ) -> None:
-    """Main pipeline function with glossary support."""
+    """Main pipeline function with glossary support and enhanced contract preservation."""
     try:
         # Initialize tokenizer
         tokenizer = tiktoken.get_encoding('cl100k_base')
@@ -281,6 +351,14 @@ async def process_contracts_pipeline(
         # Process each contract
         for contract in lines:
             try:
+                # Validate contract has content to translate
+                if not contract.get('contracts', '').strip():
+                    logger.warning(f'Empty contract found, skipping: {contract}')
+                    continue
+
+                # Store original contract structure
+                original_contract = contract.copy()
+
                 result = await process_single_contract(
                     contract_data=contract,
                     model=model,
@@ -291,21 +369,86 @@ async def process_contracts_pipeline(
                     glossary=glossary,
                 )
 
+                # Preserve original structure while adding translation
+                full_result = original_contract.copy()
+                full_result['contratos'] = result.get('contratos', '')
+
                 # Save result
                 async with aiofiles.open(output_jsonl_path, 'a', encoding='utf-8') as fout:
-                    await fout.write(json.dumps(result, ensure_ascii=False) + '\n')
+                    await fout.write(json.dumps(full_result, ensure_ascii=False) + '\n')
 
                 await asyncio.sleep(0.1)  # Rate limiting
 
             except Exception as e:
                 logger.error(f'Contract processing error: {e!s}')
-                error_result = {'contracts': contract.get('contracts', ''), 'error': str(e)}
+                error_result = original_contract.copy()
+                error_result['error'] = str(e)
                 async with aiofiles.open(output_jsonl_path, 'a', encoding='utf-8') as fout:
                     await fout.write(json.dumps(error_result, ensure_ascii=False) + '\n')
 
     except Exception as e:
         logger.error(f'Pipeline error: {e!s}')
         raise
+
+
+async def process_single_contract(
+    contract_data: dict,
+    model: str,
+    origin_language: str,
+    target_language: str,
+    tokenizer: Any,
+    log_path: Path,
+    glossary: list[ProcessedTerm] | None = None,
+    max_chunk_tokens: int = 1000,
+    overlap_tokens: int = 50,
+) -> dict:
+    """Enhanced contract processing with improved HTML handling."""
+    try:
+        original_html = contract_data['contracts']
+
+        # Validate content
+        if not original_html or not original_html.strip():
+            logger.warning('Empty contract content, returning original')
+            return contract_data
+
+        # Extract text and tag positions with enhanced tracking
+        plain_text, tag_positions = extract_text_from_html(original_html)
+
+        # Chunk text while preserving structure
+        chunks = chunk_text_by_tokens(plain_text, max_tokens=max_chunk_tokens, overlap_tokens=overlap_tokens)
+
+        # Translate non-empty chunks
+        translated_chunks = []
+        for chunk in chunks:
+            if chunk[0].strip():
+                translated_chunk = await process_segment(
+                    segment_text=chunk,
+                    original_html=original_html,
+                    model=model,
+                    origin_language=origin_language,
+                    target_language=target_language,
+                    glossary=glossary,
+                    log_path=log_path,
+                )
+                translated_chunks.append(translated_chunk)
+            else:
+                translated_chunks.append(chunk[0])
+
+        # Combine translations and reinsert HTML
+        combined_translation = ''.join(translated_chunks)
+        translated_html = reinsert_html_tags(combined_translation, tag_positions)
+
+        # Clean and normalize the translated HTML
+        cleaned_html = clean_translated_html(translated_html)
+
+        # Create result maintaining original structure
+        result = contract_data.copy()
+        result['contratos'] = cleaned_html
+        return result
+
+    except Exception as e:
+        logger.error(f'Error processing contract: {e!s}')
+        return contract_data
 
 
 # ------------
