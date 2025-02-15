@@ -17,10 +17,55 @@ from rich.console import Console
 
 from translator import translate, translate_glossary_terms
 
+app = typer.Typer(help='Contract Translation CLI using Google Generative AI')
 console = Console()
-app = typer.Typer(
-    help="Contract Translation Pipeline - Translates legal documents using Google's Generative AI",
-    add_completion=False,
+
+# ------------
+# CLI Interface
+# ------------
+
+
+# Define core options at module level
+INPUT_FILE = typer.Option(
+    'input.jsonl',
+    '--input',
+    '-i',
+    help='Input JSONL file containing contracts to translate',
+)
+
+OUTPUT_FILE = typer.Option(
+    'output.jsonl',
+    '--output',
+    '-o',
+    help='Output JSONL file for translated contracts',
+)
+
+ORIGIN_LANGUAGE = typer.Option(
+    'American English',
+    '--origin-lang',
+    '-ol',
+    help='Origin language code',
+)
+
+TARGET_LANGUAGE = typer.Option(
+    'Brazilian Portuguese',
+    '--target-lang',
+    '-tl',
+    help='Target language code',
+)
+
+MODEL = typer.Option(
+    'gemini-2.0-flash',
+    '--model',
+    '-m',
+    help='Google Generative AI model to use',
+)
+
+GLOSSARY_FILE = typer.Option(
+    None,
+    '--glossary',
+    '-g',
+    help='Optional JSON file containing glossary terms',
 )
 
 # ------------
@@ -451,70 +496,54 @@ async def process_single_contract(
         return contract_data
 
 
-# ------------
-# CLI Interface
-# ------------
-@app.command()
-def main(
-    input_file: Path = typer.Option(
-        'input.jsonl',
-        '--input',
-        '-i',
-        help='Input JSONL file containing contracts to translate',
-    ),
-    output_file: Path = typer.Option(
-        'output.jsonl',
-        '--output',
-        '-o',
-        help='Output JSONL file for translated contracts',
-    ),
-    origin_language: str = typer.Option(
-        'American English',
-        '--origin-lang',
-        '-ol',
-        help='Origin language code',
-    ),
-    target_language: str = typer.Option(
-        'Brazilian Portuguese',
-        '--target-lang',
-        '-tl',
-        help='Target language code',
-    ),
-    model: str = typer.Option(
-        'gemini-2.0-flash',
-        '--model',
-        '-m',
-        help='Google Generative AI model to use',
-    ),
-    glossary_file: Path | None = typer.Option(
-        None,
-        '--glossary',
-        '-g',
-        help='Optional JSON file containing glossary terms',
-    ),
-):
-    """Translate contracts from JSONL using Google's Generative AI with optional glossary support."""
+async def process_translation_start(
+    input_file: Path,
+    output_file: Path,
+    model: str,
+    origin_language: str,
+    target_language: str,
+    glossary_file: Path | None,
+) -> None:
+    """Execute the translation process."""
+    if not input_file.exists():
+        console.print(f'[red]Error: Input file {input_file} does not exist[/]')
+        raise typer.Exit(1)
+
     try:
-        if not input_file.exists():
-            console.print(f'[red]Error: Input file {input_file} does not exist[/]')
-            raise typer.Exit(1)
-
-        asyncio.run(
-            process_contracts_pipeline(
-                input_jsonl_path=str(input_file),
-                output_jsonl_path=str(output_file),
-                model=model,
-                origin_language=origin_language,
-                target_language=target_language,
-                glossary_path=str(glossary_file) if glossary_file else None,
-            )
+        await process_contracts_pipeline(
+            input_jsonl_path=str(input_file),
+            output_jsonl_path=str(output_file),
+            model=model,
+            origin_language=origin_language,
+            target_language=target_language,
+            glossary_path=str(glossary_file) if glossary_file else None,
         )
-
         console.print('\n[green]✨ Translation completed successfully![/]')
-
     except Exception as e:
         console.print(f'\n[red]Error: {e!s}[/]')
         raise typer.Exit(1)
+
+
+@app.command()
+def main(
+    input_file: Path = INPUT_FILE,
+    output_file: Path = OUTPUT_FILE,
+    origin_language: str = ORIGIN_LANGUAGE,
+    target_language: str = TARGET_LANGUAGE,
+    model: str = MODEL,
+    glossary_file: Path | None = GLOSSARY_FILE,
+) -> None:
+    """Translate contracts from JSONL using Google's Generative AI with optional glossary support."""
+    asyncio.run(
+        process_translation_start(
+            input_file=input_file,
+            output_file=output_file,
+            model=model,
+            origin_language=origin_language,
+            target_language=target_language,
+            glossary_file=glossary_file,
+        )
+    )
 
 
 if __name__ == '__main__':
